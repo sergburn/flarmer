@@ -15,7 +15,7 @@ Length | 34.2mm
 Width | 25.6mm
 Weight | 10g
 
-## Pinout ##
+## Pinout
 
 Pin | Function | ESP-8266 Pin |
 --- | --- | --- |
@@ -38,3 +38,30 @@ RST | Reset | RST
 
 All of the IO pins have interrupt/pwm/I2C/one-wire support except D0.
 All of the IO pins run at 3.3V.
+
+## Reset 
+
+reset causes:
+- 0: 
+- 1: normal boot
+- 2: reset pin
+- 3: software reset
+- 4: watchdog reset
+
+boot device:
+- 0:
+- 1: ram
+- 3: flash
+
+## Boot Mode
+
+N | G15/D8 | G0/D3 | G2/D4 | Boot Mode
+--- | --- | --- | --- | ---
+0 |   0    |   0   |   0   | INV
+1 |   0    |   0   |  3.3  | UART
+2 |   0    |  3.3  |   0   | INV
+3 |   0    |  3.3  |  3.3  | Flash 
+4 |  3.3   |   0   |   0   | SDIO
+5 |  3.3   |   0   |  3.3  | SDIO
+6 |  3.3   |  3.3  |   0   | SDIO
+7 |  3.3   |  3.3  |  3.3  | SDIO
