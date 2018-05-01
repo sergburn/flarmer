@@ -1,0 +1,3 @@
+graft flarmer/templates
+graft flarmer/static
+include flarmer/schema.sql

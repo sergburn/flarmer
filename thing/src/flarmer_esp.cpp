@@ -1,33 +1,48 @@
+#include <limits>
 #include <stdint.h>
 
 #include <ESP8266WiFi.h>
 #include <ESP8266mDNS.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
-#include <Adafruit_TCS34725.h>
+
+//#include <Adafruit_Sensor.h>
+#include <DHT.h>
 
 #include <BlynkSimpleEsp8266.h>
 
-const char* ssid = "Pandora";
-const char* password = "kospoozyat";
+#include "credentials.h"
+#include "color_engine.h"
 
-const char* blynk_auth = "24079142884247ba8242fc208221f75d";
+static uint8_t macAddr[WL_MAC_ADDR_LENGTH];
 
 volatile static bool isUpdating = false;
 static unsigned long lastTime = 0;
-static const unsigned long PERIOD = 1000;
+static const unsigned long UPLOAD_PERIOD_BLYNK = 1000;
 
-Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_700MS, TCS34725_GAIN_1X);
-bool hasTcs = false;
+static const unsigned long UPLOAD_PERIOD_FLARMER = 5000;
+static unsigned long uploadTimeFlarmer = 0;
+
+#define DHT_PIN 0 // D3, 10k Pull-up, GPIO0
+
+DHT dht(DHT_PIN, DHT22, 0);
+
+ColorEngine colorEngine;
+
+ADC_MODE(ADC_VCC);
 
 void setup()
 {
     Serial.begin(115200);
     Serial.println("Booting");
 
+    // DHT
+    pinMode(DHT_PIN, INPUT_PULLUP);
+    dht.begin();
+
     // WIFI
     WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid, password);
+    WiFi.begin(WLAN_SSID, WLAN_PASSWD);
     while (WiFi.waitForConnectResult() != WL_CONNECTED)
     {
         Serial.println("Connection Failed! Rebooting...");
@@ -35,19 +50,20 @@ void setup()
         ESP.restart();
     }
 
-    // TCS34725
-    if (tcs.begin())
+    WiFi.macAddress(macAddr);
+    Serial.print("MAC: ");
+    Serial.println(WiFi.macAddress());
+
+    // Color sensors
+    if (!colorEngine.init())
     {
-        Serial.println("Found TCS34725");
-        hasTcs = true;
-    }
-    else
-    {
-        Serial.println("No TCS34725 found ... check your connections");
+        Serial.println("Color measurements not available! Rebooting...");
+        delay(5000);
+        ESP.restart();
     }
 
     // BLYNK
-    Blynk.config(blynk_auth);
+    Blynk.config(BLYNK_AUTH);
 
     // OTA
 
@@ -97,13 +113,102 @@ void setup()
     });
     ArduinoOTA.begin();
     Serial.println("Ready");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
 }
 
 uint16_t mapTcsToBlynk(uint16_t chn)
 {
     return map(chn, 0, 2000, 0, 1023);
+}
+
+void uploadToBlynk(const ColorMsmt& msm)
+{
+    Blynk.run();
+
+    Blynk.virtualWrite(V0, mapTcsToBlynk(msm.r));
+    Blynk.virtualWrite(V1, mapTcsToBlynk(msm.g));
+    Blynk.virtualWrite(V2, mapTcsToBlynk(msm.b));
+    Blynk.virtualWrite(V3, mapTcsToBlynk(msm.c));
+}
+
+enum WarmerState
+{
+    WRMR_STATE_OFF,
+    WRMR_STATE_STANDBY,
+    WRMR_STATE_WARMING
+};
+
+WarmerState convertColorToState(const ColorMsmt& clr)
+{
+    if (clr.c < 50)
+        return WRMR_STATE_OFF;
+    else if (clr.g > clr.r)
+        return WRMR_STATE_STANDBY;
+    else
+        return WRMR_STATE_WARMING;
+}
+
+struct Measurement
+{
+    WarmerState wstate;
+    float temperature;
+    float humidity;
+};
+
+size_t writeFloat(WiFiClient& wifi, float value)
+{
+    uint32_t u4 = htonl(*(uint32_t*)&value);
+    return wifi.write((char*) &u4, 4);
+}
+
+size_t writeInt32(WiFiClient& wifi, uint32_t value)
+{
+    uint32_t u4 = htonl(value);
+    return wifi.write((char*) &u4, 4);
+}
+
+void uploadToFlarmer(const Measurement& msm)
+{
+    static
+    WiFiClient wifi;
+    if (!wifi.connect("192.168.0.101", 9268)) {
+        Serial.printf("Failed to connect Flarmer, status %d\n", wifi.status());
+        return;
+    }
+
+    // '!B6cBff'
+    wifi.write(1); // version - B
+    // MAC-48 - 6c
+    wifi.write(macAddr, WL_MAC_ADDR_LENGTH);
+    // wstate - B
+    wifi.write(msm.wstate);
+    // temp - f
+    writeFloat(wifi, msm.temperature);
+    // humidity - f
+    writeFloat(wifi, msm.humidity);
+    wifi.stop();
+}
+
+void uploadMsm(const Measurement& th, const ColorMsmt& clr)
+{
+    Serial.printf("{ %4u %4u %4u %4u } -> %5u K, %3u lx\n",
+        clr.r, clr.g, clr.b, clr.c, clr.colorTemp, clr.lux);
+
+    uploadToBlynk(clr);
+
+    unsigned long now = millis();
+    if (now > uploadTimeFlarmer + UPLOAD_PERIOD_FLARMER)
+    {
+        Measurement msm;
+        msm.humidity = th.humidity;
+        msm.temperature = th.temperature;
+        msm.wstate = convertColorToState(clr);
+
+        Serial.printf("State: %d, Temp: %.1f, Humidity: %.1f\n",
+            msm.wstate, msm.temperature, msm.humidity);
+
+        uploadToFlarmer(msm);
+        uploadTimeFlarmer = now;
+    }
 }
 
 void loop()
@@ -112,33 +217,34 @@ void loop()
 
     if (!isUpdating)
     {
-        Blynk.run();
-
         unsigned long now = millis();
-        if (hasTcs)
+
+        Measurement msm;
+        msm.temperature = dht.readTemperature();
+        msm.humidity = dht.readHumidity();
+
+        ColorMsmt clr;
+        if (colorEngine.readColors(clr))
         {
-            uint16_t r, g, b, c, t, lux;        
-            tcs.getRawData(&r, &g, &b, &c);
-            t = tcs.calculateColorTemperature(r, g, b);
-            lux = tcs.calculateLux(r, g, b);
-
-            Serial.printf("{ %4u %4u %4u %4u } -> %5u K, %3u lx\n", r, g, b, c, t, lux);
-
-            Blynk.virtualWrite(V0, mapTcsToBlynk(r));
-            Blynk.virtualWrite(V1, mapTcsToBlynk(g));
-            Blynk.virtualWrite(V2, mapTcsToBlynk(b));
-            Blynk.virtualWrite(V3, mapTcsToBlynk(c));
+            uploadMsm(msm, clr);
         }
         else
         {
-            if (now > lastTime + PERIOD)
+            if (now > lastTime + UPLOAD_PERIOD_BLYNK)
             {
-                Serial.printf("ChipId %x, FlashId %x, FSize %u, FRsize %u, Freq %d\n",
+                Serial.println("Failed to read colors");
+
+                Serial.print("MAC: ");
+                Serial.println(WiFi.macAddress());
+                Serial.print("IP: ");
+                Serial.println(WiFi.localIP());
+                Serial.printf("ChipId %x, FlashId %x, FSize %u, FRsize %u, Freq %d, VCC: %hu\n",
                             ESP.getChipId(),
                             ESP.getFlashChipId(),
                             ESP.getFlashChipSize(),
                             ESP.getFlashChipRealSize(),
-                            ESP.getCpuFreqMHz());
+                            ESP.getCpuFreqMHz(),
+                            ESP.getVcc());
                 lastTime = now;
             }
         }
